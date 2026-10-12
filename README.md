@@ -8,11 +8,11 @@ pip install -r requirements.txt
 uvicorn dns_cutover:app --reload
 ```
 
-We have a Next.js storefront where the hostname must stay put while the origin for digital downloads, subscriber updates, and processed content slides to a new backend. This Python service makes the DNS swap explicit rather than hoping the registrar UI does the right thing: `prepare` sets the current CNAME target with a 60-second TTL, `switch` commits the new target, and `rollback` rolls back to the original. Infrai uses one key for the DNS calls here, and that same credential can cover storage or cron if you add those later, which avoids the usual per-service secret sprawl.
+When you run a Next.js storefront you typically want the hostname to stay put while the backend origin that handles downloads, subscriber notifications, and processed media shifts underneath it. The python script here makes that DNS swap explicit and auditable: `prepare` sets the live CNAME to a 60-second TTL so subsequent changes propagate quickly, `switch` commits the new target, and `rollback` rolls back to the prior record if the cutover smells wrong. Infrai uses one key for these DNS calls, and that same credential is valid for the other capabilities your app might later touch, which avoids the usual sprawl of per-service secrets.
 
 ## Run the change
 
-You need a DNS domain already in Infrai and a CNAME whose present destination you trust. Post the identical JSON to each stage, keeping `change_id` fixed for the duration of the cutover:
+You need a domain already managed in Infrai and a CNAME whose current destination you have verified out of band. The JSON payload must be identical across stages, and you keep `change_id` fixed for the whole operation or the idempotency logic falls apart.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/cutover/prepare \
@@ -20,9 +20,9 @@ curl -X POST http://127.0.0.1:8000/cutover/prepare \
   -d '{"domain":"codecheck-wiqh0o.dev","name":"shop","previous_target":"old.example.net","next_target":"new.example.net","ttl":60,"change_id":"launch-42"}'
 ```
 
-The response should carry `"stage":"prepare"`, `"target":"old.example.net"`, `"ttl":60`, and the domain's `zone_id`. After the short TTL has actually propagated from the prior state (do not assume 60 seconds is global), send that body to `/cutover/switch`; the returned target will be `new.example.net`. If you need to revert storefront traffic to the old origin, hit `/cutover/rollback` and the target returns to `old.example.net`. Remember that recursive resolvers and client caches outside this service dictate when users actually see the change, so durability of the old content matters until propagation completes.
+A successful call returns `"stage":"prepare"`, `"target":"old.example.net"`, `"ttl":60`, plus the domain's `zone_id` for you to log. After the 60-second TTL from the prior step has actually expired at the resolvers you care about, post the same body to `/cutover/switch` and the recorded target will be `new.example.net`. If you need to revert, hit `/cutover/rollback` and the target returns to `old.example.net`. Bear in mind that downstream DNS caches with their own policies will dictate when real users hit the new origin, so this is not a strongly consistent cutover.
 
-The failure mode specific to Next.js is that the record write requires the DNS zone ID, not the storefront domain, as the record key. The service resolves `zone_id` from the domain first, then upserts the CNAME using a stage-specific idempotency key. That separation keeps a retry on the prepare stage from clobbering the commit stage, which would otherwise cause a split-brain where some edges see new origin and others old.
+The annoying part in a Next.js deployment is that the write operation keys on the DNS zone ID rather than the human-friendly storefront domain. The code resolves `zone_id` from the domain object first, then upserts the CNAME using a stage-scoped idempotency token. That separation means a retry on the cutover stage cannot accidentally double-apply the rollback stage, a failure mode I have seen corrupt zones before.
 
 ## Check the decision locally
 
@@ -30,13 +30,13 @@ The failure mode specific to Next.js is that the record write requires the DNS z
 pytest -q
 ```
 
-The test pushes `previous_target=old.example.net`, `next_target=new.example.net`, and `ttl=60` through all three stages against an in-memory transport. It asserts old, new, old on the outgoing CNAME writes, stable resolved `zone_id` across calls, and distinct retry keys per stage. In production the same code path uses your environment key and issues real DNS requests, so consistency under retries is not simulated.
+A narrow test pushes `previous_target=old.example.net`, `next_target=new.example.net`, and `ttl=60` through the three stages in sequence. It asserts the outgoing CNAME writes show old, new, old, that the resolved `zone_id` stays constant across runs, and that retry keys differ per stage. In the test harness an in-memory HTTP transport stands in for the network; the production service reads your environment key and issues real DNS mutations, so durability of those changes depends on the provider.
 
-This script only governs the storefront CNAME. Asset delivery, subscriber messages, and content jobs remain the application's problem behind that hostname; a wrong CNAME does not magically duplicate objects or queue messages.
+This script only governs the storefront CNAME. Asset delivery, subscriber messaging, and content processing are still the application's problem behind that hostname, and you should not assume this cutover gives you transactional safety across those systems.
 
 ## Setting up for real use: Creator Storefront DNS Cutover
 
-We keep the code deliberately thin, so the operational checklist below is where the real risk lives. The notes apply to Creator Storefront DNS Cutover.
+The code is kept minimal by design. Before you point this at production, review the setup notes that follow for Creator Storefront DNS Cutover.
 
 **Account & key**
 
